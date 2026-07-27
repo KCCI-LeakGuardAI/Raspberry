@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -40,8 +41,21 @@
  *  그래서 장치 경로만 바꾸면 무선/유선이 그대로 호환된다. raw 8N1 로 연다. */
 static int serial_open(const char *dev, int baud)
 {
-    int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    /*
+     * O_NONBLOCK 을 주지 않고 연다.
+     * /dev/rfcomm0 은 진짜 UART 가 아니라 블루투스 소켓이라, 실제 RFCOMM
+     * 연결이 open() 시점에 맺힌다. O_NONBLOCK 을 주면 연결을 기다리지 않고
+     * 즉시 성공해버려서, 링크가 안 붙은 상태로 write() 가 커널 버퍼에만
+     * 쌓이며 "성공"으로 보인다. 그리고 몇 초 뒤 연결 시도가 실패하면서
+     * hangup 이 뜬다 -> 원인이 엉뚱한 곳(배선)으로 보인다.
+     * 여기서 블로킹으로 열면 연결 실패가 open() 에서 바로 드러난다.
+     */
+    int fd = open(dev, O_RDWR | O_NOCTTY);
     if (fd < 0) return -1;
+
+    /* 연결이 맺힌 뒤에야 논블로킹으로 전환한다(select/read 루프용). */
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) { close(fd); return -1; }
 
     struct termios tio;
     tcgetattr(fd, &tio);
@@ -51,10 +65,41 @@ static int serial_open(const char *dev, int baud)
     tio.c_cflag |= (CLOCAL | CREAD);
     tio.c_cflag &= ~CSTOPB;   tio.c_cflag &= ~PARENB;         /* 8N1 */
     tio.c_cflag &= ~CSIZE;    tio.c_cflag |= CS8;
-    tio.c_cc[VMIN] = 0; tio.c_cc[VTIME] = 0;                  /* 논블로킹 */
+    tio.c_cflag &= ~CRTSCTS;                                  /* HW 흐름제어 끔.
+                                   cfmakeraw() 는 CRTSCTS 를 건드리지 않는다.
+                                   켜진 채로 CTS 가 안 뜨면 출력이 막혀 EAGAIN 이 된다. */
+    /*
+     * VMIN=1 이어야 read() 의 반환값이 명확해진다.
+     *   VMIN=0 : 데이터 없음도 0, 링크 끊김(EOF)도 0  -> 구분 불가
+     *   VMIN=1 : 데이터 없음은 -1/EAGAIN, 0 은 진짜 EOF 뿐
+     * 논블로킹은 VMIN 이 아니라 O_NONBLOCK 이 보장한다.
+     */
+    tio.c_cc[VMIN] = 1; tio.c_cc[VTIME] = 0;
     tcsetattr(fd, TCSANOW, &tio);
     tcflush(fd, TCIOFLUSH);
     return fd;
+}
+
+/* O_NONBLOCK 포트에 len 바이트를 끝까지 쓴다.
+ *  - EAGAIN: 커널 출력 버퍼가 찬 것뿐이므로 짧게 기다렸다 재시도한다.
+ *  - 그 외 errno: 링크가 끊어진 것(ENOTCONN/EIO/ECONNRESET 등)이므로 즉시 실패.
+ * 반환: 쓴 바이트 수, 또는 -1(errno 유지) */
+static ssize_t serial_write_all(int fd, const uint8_t *p, size_t len, int timeout_ms)
+{
+    size_t done = 0;
+    while (done < len) {
+        ssize_t w = write(fd, p + done, len - done);
+        if (w > 0) { done += (size_t)w; continue; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            struct pollfd pf = { .fd = fd, .events = POLLOUT };
+            int pr = poll(&pf, 1, timeout_ms);
+            if (pr > 0 && (pf.revents & POLLOUT)) continue;
+            if (pr == 0) errno = ETIMEDOUT;
+            return (done > 0) ? (ssize_t)done : -1;
+        }
+        return (done > 0) ? (ssize_t)done : -1;
+    }
+    return (ssize_t)done;
 }
 
 /* =============================== [2] CRC / 패킷 ============================= */
@@ -142,16 +187,38 @@ static int make_listen(int port)
 /* =============================== [5] main ================================= */
 int main(int argc, char **argv)
 {
-    int         port = (argc > 1) ? atoi(argv[1]) : DEFAULT_PORT;
-    const char *dev  = (argc > 2) ? argv[2]       : DEFAULT_DEV;
-    int         baud = (argc > 3) ? atoi(argv[3]) : DEFAULT_BAUD;
+    int         port = DEFAULT_PORT;
+    const char *dev  = DEFAULT_DEV;
+    int         baud = DEFAULT_BAUD;
+    int         dump = 0;                       /* --dump : 원시 수신 바이트 출력 */
+
+    /* 위치 인자(port, dev, baud) 순서는 그대로 두고 --dump 만 어디서든 받는다. */
+    {
+        int pos = 0;
+        for (int i = 1; i < argc; i++) {
+            if (!strcmp(argv[i], "--dump")) { dump = 1; continue; }
+            switch (pos++) {
+            case 0: port = atoi(argv[i]); break;
+            case 1: dev  = argv[i];       break;
+            case 2: baud = atoi(argv[i]); break;
+            default: break;
+            }
+        }
+    }
+
+    printf("[server] %s 연결 시도중... (HC-06 LED 가 켜진 채 고정되면 성공)\n", dev);
+    fflush(stdout);
 
     int serial_fd = serial_open(dev, baud);
     if (serial_fd < 0) {
-        fprintf(stderr, "[server] 시리얼 열기 실패: %s\n"
-                        "  HC-06 을 먼저 bind 하세요: sudo rfcomm bind 0 <MAC> 1\n", dev);
+        fprintf(stderr, "[server] 시리얼 열기 실패: %s (errno=%d %s)\n"
+                        "  1) sudo rfcomm bind 0 <MAC> 1  로 바인딩했는지\n"
+                        "  2) bluetoothctl 에서 pair/trust 했는지 (PIN 1234)\n"
+                        "  3) HC-06 에 전원이 들어와 LED 가 깜빡이는지\n",
+                dev, errno, strerror(errno));
         return 1;
     }
+    printf("[server] 시리얼 연결 완료\n");
     int listen_fd = make_listen(port);
     if (listen_fd < 0) { fprintf(stderr, "[server] 소켓 준비 실패\n"); return 1; }
 
@@ -199,10 +266,14 @@ int main(int argc, char **argv)
                             build_packet(pkt, seq, state, area, spread, zone);
                             tx_time[seq] = now_s();
                             /* STM32 로 전달 */
-                            ssize_t w = write(serial_fd, pkt, 12);
+                            errno = 0;
+                            ssize_t w = serial_write_all(serial_fd, pkt, 12, 200);
+                            char why[96] = "";
+                            if (w != 12)
+                                snprintf(why, sizeof(why), "  [전송실패 w=%zd errno=%d %s]",
+                                         w, errno, strerror(errno));
                             printf("-> STM32  seq=%3u state=%d area=%5d spread=%+4d zone=%d%s\n",
-                                   seq, state, area, spread, zone,
-                                   (w == 12) ? "" : "  [전송실패]");
+                                   seq, state, area, spread, zone, why);
                             fflush(stdout);
                             seq++;
                         }
@@ -217,7 +288,33 @@ int main(int argc, char **argv)
         /* (3) STM32 텔레메트리 -> 로그 */
         if (FD_ISSET(serial_fd, &r)) {
             uint8_t buf[256];
+            errno = 0;
             ssize_t n = read(serial_fd, buf, sizeof(buf));
+
+            /* VMIN=1 이므로 여기서의 0 은 진짜 EOF(RFCOMM 끊김)뿐이다.
+               데이터 없음은 -1/EAGAIN 으로 오며 그냥 넘긴다. */
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) n = 0;
+                else {
+                    fprintf(stderr, "[server] 시리얼 read 오류: %s\n", strerror(errno));
+                    break;
+                }
+            } else if (n == 0) {
+                fprintf(stderr, "[server] 시리얼 링크 끊김(EOF). "
+                                "sudo rfcomm release 0 후 다시 bind 하세요.\n");
+                break;
+            }
+
+            /* 원시 바이트 덤프 — 진단의 핵심.
+             *   A5 5A .. 로 시작하는 8바이트가 보이면 : 정상, 보드레이트 일치
+             *   아무것도 안 보이면                    : STM32 TX(PA9) 미연결
+             *   무의미한 바이트가 쏟아지면            : 보드레이트 불일치 */
+            if (dump && n > 0) {
+                printf("[raw %2zd] ", n);
+                for (ssize_t i = 0; i < n; i++) printf("%02X ", buf[i]);
+                printf("\n"); fflush(stdout);
+            }
+
             for (ssize_t i = 0; i < n; i++) {
                 uint8_t tseq, fsm, flags;
                 if (feed_telemetry(buf[i], &tseq, &fsm, &flags)) {
