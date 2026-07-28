@@ -14,6 +14,12 @@
  *  버티지 못한다. 평균값은 1초 샘플이면 충분하고, 정작 중요한 "언제 터졌나"
  *  는 전이 시점만 있으면 정확히 복원된다.
  *
+ *  스레드는 둘이다. 둘 다 자기 커넥션을 갖고, server 의 select() 루프는 어느
+ *  쪽도 건드리지 않는다:
+ *    writer (db_writer)  큐에서 INSERT 를 꺼내 실행 — 쓰기 전용
+ *    stats  (db_stats)   N초마다 SELECT 로 집계해 화면에 한 줄 — 읽기 전용
+ *  집계를 writer 에 얹지 않은 이유는 leak_db.h 의 leakDbStartStats() 주석 참고.
+ *
  *  `./server --dblog` (leakDbSetVerbose) 를 주면 남기는 행을 화면에도 찍는다.
  *  DB 에 조용히 쌓이기만 하면 값이 맞는지 눈으로 확인할 방법이 없기 때문이다.
  *  쌓인 이력을 나중에 훑어보는 쪽은 `MariaDB/leakdb/leak_tail`(실시간 tail) 과
@@ -23,6 +29,7 @@
 
 #include "leak_db.h"
 
+#include <errno.h>
 #include <mysql/mysql.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -54,6 +61,12 @@ static pthread_t      q_thread;
 static int            g_on;             /* 로깅 활성 여부 */
 static int            g_lib;            /* mysql_library_init() 호출 여부 */
 static int            g_verbose;        /* --dblog : 남기는 행을 화면에도 출력 */
+
+/* 집계 스레드(--avg). writer 와 완전히 분리된 읽기 전용 경로다 — 이유는 leak_db.h */
+static pthread_t       s_thread;
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_cond = PTHREAD_COND_INITIALIZER;
+static int             s_on, s_stop, s_period;
 
 /* --------------------------- 화면 출력용 이름표 ---------------------------
  * DB 의 fsm_code / leak_state_code 테이블을 조회하지 않고 여기에 둔 이유:
@@ -186,6 +199,101 @@ static void *db_writer(void *arg)
     return NULL;
 }
 
+/* ----------------------------- 집계 스레드 --------------------------------
+ *  주기마다 최근 period 초 구간을 DB 에서 집계해 한 줄 찍는다.
+ *  읽기 전용이고 자기 커넥션을 쓰므로 writer 와도, server 의 select() 루프와도
+ *  간섭하지 않는다 — 화면에 통계를 띄우는 대가로 중계가 늦는 일이 없다.
+ *
+ *  sleep() 이 아니라 pthread_cond_timedwait 을 쓰는 이유:
+ *  종료할 때 최대 period 초를 자다 말고 매달리면 Ctrl-C 가 안 먹는 것처럼 보인다.
+ *  leakDbClose() 가 깨워서 즉시 빠져나오게 한다.
+ *  (cond 의 기본 클럭은 CLOCK_REALTIME 이다. mono() 의 CLOCK_MONOTONIC 과
+ *   섞으면 대기 시간이 엉뚱해지므로 deadline 도 REALTIME 으로 잡는다.) */
+static void *db_stats(void *arg)
+{
+    (void)arg;
+    MYSQL *con = NULL;
+    mysql_thread_init();
+
+    for (;;) {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_sec += s_period;
+
+        /* timedwait 은 spurious wakeup 이 있으므로 ETIMEDOUT 을 직접 확인한다 */
+        int timed_out = 0;
+        pthread_mutex_lock(&s_lock);
+        while (!s_stop && !timed_out) {
+            if (pthread_cond_timedwait(&s_cond, &s_lock, &until) == ETIMEDOUT)
+                timed_out = 1;
+        }
+        int stop = s_stop;
+        pthread_mutex_unlock(&s_lock);
+        if (stop) break;
+
+        if (!con) con = db_connect();
+        if (!con) continue;                  /* 다음 주기에 다시 시도 */
+
+        /*
+         * ts 는 앱이 localtime 으로 박아 넣은 값이라 NOW() 와 같은 시간축이다.
+         * Pi 와 MariaDB 의 타임존이 어긋나 있으면 여기서 0행이 나온다
+         * (schema.sql 머리말의 timedatectl 안내 참고).
+         *
+         * "누수" 는 state BETWEEN 1 AND 3 이다. state=1 만 세면 WARNING/DANGER
+         * 가 통계에서 빠져 심할수록 안 보이는 정반대 결과가 나온다.
+         */
+        /* SQL_LEN(384) 을 쓰지 않는다 — 그건 INSERT 한 줄이 들어가는 큐 칸의
+           크기이고, 이 집계 쿼리는 그보다 길어서 잘릴 수 있다. */
+        char sql[512];
+        snprintf(sql, sizeof(sql),
+                 "SELECT COUNT(*),"
+                 " IFNULL(AVG(area),0)/100,"
+                 " IFNULL(MAX(area),0)/100,"
+                 " IFNULL(100*SUM(state BETWEEN 1 AND 3)/COUNT(*),0),"
+                 " IFNULL(AVG(CASE WHEN state BETWEEN 1 AND 3 THEN area END),0)/100,"
+                 " IFNULL(SUM(state=3),0),"
+                 " IFNULL(SUM(zone=1),0),"
+                 " IFNULL(SUM(state=4),0),"
+                 " IFNULL(SUM(latched=1),0)"
+                 " FROM leak_sample WHERE ts >= NOW() - INTERVAL %d SECOND",
+                 s_period);
+
+        if (mysql_query(con, sql)) {
+            fprintf(stderr, "[leakdb] 집계 실패: %s\n", mysql_error(con));
+            mysql_close(con);
+            con = NULL;                      /* 다음 주기에 재접속 */
+            continue;
+        }
+
+        MYSQL_RES *res = mysql_store_result(con);
+        MYSQL_ROW  r   = res ? mysql_fetch_row(res) : NULL;
+        if (r) {
+            long n = r[0] ? atol(r[0]) : 0L;
+            if (n == 0) {
+                /* 값이 0 인 것과 데이터가 없는 것은 다르다. 평균 0.00% 로
+                   찍으면 "정상"으로 읽혀 Jetson 이 끊긴 걸 놓친다. */
+                printf("[db:avg %2ds] 최근 구간에 샘플 없음 "
+                       "(Jetson 미접속이거나 INSERT 실패)\n", s_period);
+            } else {
+                printf("[db:avg %2ds] n=%3ld  area 평균 %5.2f%% / 최대 %5.2f%%  "
+                       "누수 %3.0f%%(누수중 평균 %5.2f%%)  "
+                       "DANGER=%s zone=%s ERR=%s latch=%s\n",
+                       s_period, n,
+                       r[1] ? atof(r[1]) : 0.0, r[2] ? atof(r[2]) : 0.0,
+                       r[3] ? atof(r[3]) : 0.0, r[4] ? atof(r[4]) : 0.0,
+                       r[5] ? r[5] : "0", r[6] ? r[6] : "0",
+                       r[7] ? r[7] : "0", r[8] ? r[8] : "0");
+            }
+            fflush(stdout);
+        }
+        if (res) mysql_free_result(res);
+    }
+
+    if (con) mysql_close(con);
+    mysql_thread_end();
+    return NULL;
+}
+
 /* -------------------------------- 공개 API -------------------------------- */
 static void pick(char *dst, size_t n, const char *env, const char *arg, const char *def)
 {
@@ -242,8 +350,33 @@ int leakDbInit(const char *host, const char *user, const char *pass, const char 
     return 1;
 }
 
+void leakDbStartStats(int period_s)
+{
+    if (!g_on || period_s <= 0 || s_on) return;
+
+    s_period = period_s;
+    s_stop   = 0;
+    if (pthread_create(&s_thread, NULL, db_stats, NULL) != 0) {
+        fprintf(stderr, "[leakdb] 집계 스레드 생성 실패 — 통계 출력 없이 계속합니다\n");
+        return;
+    }
+    s_on = 1;
+    printf("[leakdb] %d초마다 DB 집계 출력 (--avg)\n", period_s);
+}
+
 void leakDbClose(void)
 {
+    /* 집계 스레드부터 내린다. g_on 검사보다 앞이어야 한다 — 아래 이른 반환에
+       걸리면 스레드가 살아남아 프로세스가 안 끝난다. */
+    if (s_on) {
+        pthread_mutex_lock(&s_lock);
+        s_stop = 1;
+        pthread_cond_signal(&s_cond);
+        pthread_mutex_unlock(&s_lock);
+        pthread_join(s_thread, NULL);
+        s_on = 0;
+    }
+
     /* leakDbInit() 자체를 안 불렀거나(--nodb) 초기화에 실패한 경우.
      * mysql_library_init() 을 안 했다면 end() 도 부르지 않는다. */
     if (!g_on) { if (g_lib) { mysql_library_end(); g_lib = 0; } return; }

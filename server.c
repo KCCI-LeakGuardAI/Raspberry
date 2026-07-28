@@ -15,10 +15,19 @@
  *       DB 는 부가 기능이라 접속이 실패해도 1~3 은 그대로 동작한다.
  *       --dblog 를 주면 DB 에 남기는 행(시각/state/area/FSM/latch)을
  *       화면에도 같이 찍는다. 안 주면 조용히 쌓이기만 한다.
+ *       --avg=N 은 N초마다 DB 를 집계해 한 줄 요약을 찍는다(leak_db.c 의 별도
+ *       스레드가 한다 — 이 파일의 select() 루프는 건드리지 않는다).
+ *
+ *  이 파일은 판정을 하지 않는다. 받은 값을 그대로 옮기기만 한다.
+ *  "손이 스쳐서 DANGER 가 되는" 오검출 억제는 STM32 가 한다 —
+ *  safety_fsm.h 의 FSM_LATCH_CONFIRM(DANGER 5초 유지 시에만 래치).
+ *  Pi 에서 값을 붙잡으면 Pi 가 죽거나 재시작할 때 필터가 통째로 사라지고,
+ *  붙잡힌 낡은 area 때문에 STM32 의 독립 면적 판정까지 눈이 먼다.
  *
  *  빌드 : gcc -Wall -O2 -o server server.c leak_db.c -lmysqlclient -lpthread
- *  실행 : ./server [TCP_PORT] [SERIAL_DEV] [BAUD] [--dump] [--nodb] [--dblog]
- *         ./server 5000 /dev/rfcomm0 115200
+ *  실행 : ./server [TCP_PORT] [SERIAL_DEV] [BAUD]
+ *                  [--dump] [--nodb] [--dblog] [--avg[=N]]
+ *         ./server 5000 /dev/rfcomm0 115200 --avg=10
  * ========================================================================== */
 
 #include <stdio.h>
@@ -213,14 +222,23 @@ int main(int argc, char **argv)
     int         dump = 0;                       /* --dump  : 원시 수신 바이트 출력 */
     int         nodb = 0;                       /* --nodb  : DB 로깅 끄기 */
     int         dblog = 0;                      /* --dblog : DB 에 남기는 행도 출력 */
+    int         avg_s = 0;                      /* --avg=N : N초마다 DB 집계 출력 */
 
-    /* 위치 인자(port, dev, baud) 순서는 그대로 두고 옵션은 어디서든 받는다. */
+    /* 위치 인자(port, dev, baud) 순서는 그대로 두고 옵션은 어디서든 받는다.
+       --avg 는 값을 붙여 쓴다(--avg=10). 별도 인자로 받으면 위치
+       인자 계산이 어긋나 dev 나 baud 자리를 먹는다. */
     {
         int pos = 0;
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--dump"))  { dump  = 1; continue; }
             if (!strcmp(argv[i], "--nodb"))  { nodb  = 1; continue; }
             if (!strcmp(argv[i], "--dblog")) { dblog = 1; continue; }
+            if (!strncmp(argv[i], "--avg", 5) &&
+                (argv[i][5] == '\0' || argv[i][5] == '=')) {
+                avg_s = (argv[i][5] == '=') ? atoi(argv[i] + 6) : 10;
+                if (avg_s < 1) avg_s = 10;
+                continue;
+            }
             switch (pos++) {
             case 0: port = atoi(argv[i]); break;
             case 1: dev  = argv[i];       break;
@@ -253,9 +271,14 @@ int main(int argc, char **argv)
     if (!nodb) {
         if (dblog) leakDbSetVerbose(1);
         leakDbInit(NULL, NULL, NULL, NULL);
+        /* 집계는 DB 를 읽어야 하므로 로깅이 살아있을 때만 의미가 있다.
+           내부에서 g_on 을 확인하므로 접속 실패 시 조용히 넘어간다. */
+        leakDbStartStats(avg_s);
     } else {
         printf("[leakdb] --nodb : 로깅 안 함%s\n",
                dblog ? " (--dblog 는 --nodb 와 같이 쓰면 의미가 없습니다)" : "");
+        if (avg_s)
+            printf("[leakdb] --avg 는 DB 를 읽어 집계하므로 --nodb 와 같이 쓸 수 없습니다\n");
     }
 
     printf("[server] Jetson(client) 접속 대기...\n");
@@ -288,7 +311,10 @@ int main(int argc, char **argv)
         if (client_fd >= 0 && FD_ISSET(client_fd, &r)) {
             char buf[256];
             ssize_t n = read(client_fd, buf, sizeof(buf));
-            if (n <= 0) { printf("[server] Jetson 연결 끊김\n"); close(client_fd); client_fd = -1; }
+            if (n <= 0) {
+                printf("[server] Jetson 연결 끊김\n");
+                close(client_fd); client_fd = -1;
+            }
             else {
                 for (ssize_t i = 0; i < n; i++) {
                     char c = buf[i];
@@ -337,7 +363,10 @@ int main(int argc, char **argv)
                         fflush(stdout);
 
                         /* DB 기록 — 큐에 넣기만 하므로 블로킹되지 않는다.
-                           STM32 전송 뒤에 두어 실패해도 중계가 늦지 않게 함. */
+                           STM32 전송 뒤에 두어 실패해도 중계가 늦지 않게 함.
+                           STM32 로 보낸 값 그대로 넘긴다 — leak_sample 은
+                           "STM32 가 본 값" 이어야 leak_event 의 FSM 전이와
+                           앞뒤가 맞는다. */
                         leakDbOnCommand(seq, state, area, spread, zone);
 
                         seq++;

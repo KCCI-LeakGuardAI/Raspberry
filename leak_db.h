@@ -40,7 +40,20 @@ void leakDbSetVerbose(int on);
  * 쓰고, 환경변수 LEAKDB_HOST/USER/PASS/NAME 이 있으면 그쪽이 우선한다. */
 int  leakDbInit(const char *host, const char *user, const char *pass, const char *db);
 
-/* 큐를 비우고 스레드 종료 + 접속 해제 */
+/* 주기적으로 leak_sample 을 집계해 화면에 한 줄 찍는 읽기 전용 스레드를 띄운다.
+ * period_s <= 0 이면 아무것도 하지 않는다. leakDbInit() 이 1 을 반환한 뒤에 부른다.
+ *
+ *   [db:avg 10s] n= 10  area 평균 0.42% / 최대 3.61%  누수 30%(누수중 1.38%)
+ *                DANGER=1 zone=0 ERR=0
+ *
+ * writer 스레드에 얹지 않고 스레드/커넥션을 따로 두는 이유:
+ *   - SELECT 가 느린 순간 INSERT 큐가 안 빠져 q_drop 이 올라간다. 통계를 보려다
+ *     통계 원본을 버리게 된다.
+ *   - MYSQL* 은 두 용도로 동시에 쓸 수 없다.
+ * server.c 의 select() 루프는 전혀 건드리지 않으므로 중계 지연이 0 이다. */
+void leakDbStartStats(int period_s);
+
+/* 큐를 비우고 스레드 종료 + 접속 해제 (집계 스레드도 같이 내린다) */
 void leakDbClose(void);
 
 /* Jetson -> STM32 명령 1건 (server.c 의 build_packet() 직후에 호출)
